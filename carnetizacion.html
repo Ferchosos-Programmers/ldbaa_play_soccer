@@ -95,6 +95,7 @@
         firebase.initializeApp(firebaseConfig);
       }
       const db = firebase.firestore();
+      db.settings({ experimentalForceLongPolling: true, merge: true });
 
       const championshipsContainer = document.getElementById("championshipsContainer");
       const searchInput = document.getElementById("searchInput");

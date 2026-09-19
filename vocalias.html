@@ -305,7 +305,7 @@
             <select
               id="campSelect"
               class="select-premium"
-              onchange="resetAndLoad()"
+              onchange="onChampionshipChange()"
             >
               <option value="">Cargando campeonatos...</option>
             </select>
@@ -889,8 +889,8 @@
 
     <!-- Scripts -->
     <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
-    <script src="https://www.gstatic.com/firebasejs/8.9.1/firebase-app.js"></script>
-    <script src="https://www.gstatic.com/firebasejs/8.9.1/firebase-firestore.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/8.10.1/firebase-app.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/8.10.1/firebase-firestore.js"></script>
 
     <script>
       const firebaseConfig = {
@@ -904,17 +904,6 @@
       if (!firebase.apps.length) firebase.initializeApp(firebaseConfig);
       const db = firebase.firestore();
 
-      // Habilitar persistencia local (IndexedDB) para respuestas instantáneas de caché
-      if (typeof db.enablePersistence === "function") {
-        db.enablePersistence({ synchronizeTabs: true }).catch((err) => {
-          if (err.code === "failed-precondition") {
-            console.warn("Firestore persistence falló: múltiples pestañas abiertas");
-          } else if (err.code === "unimplemented") {
-            console.warn("Firestore persistence no está soportada en este navegador");
-          }
-        });
-      }
-
       let fixturesMap = new Map();
       const fixturesCacheByCamp = new Map();
       const championshipTeamsCache = new Map();
@@ -922,10 +911,13 @@
       let _preloadChampionshipTimer = null;
 
       function initAppEvents() {
-        if (typeof preloadAllLeaguePlayersAndTeams === "function") {
-          preloadAllLeaguePlayersAndTeams();
-        }
         loadChampionships();
+        setTimeout(() => {
+          if (typeof preloadAllLeaguePlayersAndTeams === "function") {
+            preloadAllLeaguePlayersAndTeams();
+          }
+        }, 100);
+
         const vocaliaModalEl = document.getElementById("vocaliaModal");
         if (vocaliaModalEl) {
           vocaliaModalEl.addEventListener("hidden.bs.modal", () => {
@@ -944,10 +936,49 @@
         initAppEvents();
       }
 
+      function onChampionshipChange() {
+        const select = document.getElementById("campSelect");
+        if (select && select.value) {
+          try {
+            localStorage.setItem("last_selected_camp", select.value);
+            sessionStorage.setItem("last_selected_camp", select.value);
+          } catch (e) {}
+        }
+        currentJornada = null;
+        resetAndLoad(true);
+      }
+
       async function loadChampionships() {
         const select = document.getElementById("campSelect");
         if (!select) return;
         try {
+          // Fast-path: renderizar de inmediato (0ms) desde almacenamiento local persistente
+          const cachedChamps = localStorage.getItem("cached_championships") || sessionStorage.getItem("cached_championships");
+          const lastCampId = localStorage.getItem("last_selected_camp") || sessionStorage.getItem("last_selected_camp");
+          let hasRenderedFast = false;
+
+          if (cachedChamps && (select.options.length <= 1 || select.value === "")) {
+            try {
+              const list = JSON.parse(cachedChamps);
+              if (list && list.length > 0) {
+                select.innerHTML = "";
+                list.forEach((c) => {
+                  const opt = document.createElement("option");
+                  opt.value = c.id;
+                  opt.textContent = c.name;
+                  select.appendChild(opt);
+                });
+                if (lastCampId && list.some((c) => c.id === lastCampId)) {
+                  select.value = lastCampId;
+                } else {
+                  select.value = list[0].id;
+                }
+                hasRenderedFast = true;
+                resetAndLoad(false);
+              }
+            } catch (eC) {}
+          }
+
           let snapshot;
           try {
             snapshot = await db
@@ -955,76 +986,170 @@
               .orderBy("createdAt", "desc")
               .get();
           } catch (errOrder) {
-            console.warn("Falling back to unordered query:", errOrder);
             snapshot = await db.collection("championships").get();
           }
 
-          select.innerHTML = "";
-          if (snapshot.empty) {
+          if (snapshot && !snapshot.empty) {
+            const list = [];
+            const previousVal = select.value || lastCampId;
+            snapshot.forEach((doc) => {
+              const d = doc.data();
+              const name = d.name || d.nombre || "Campeonato";
+              list.push({ id: doc.id, name });
+            });
+            try {
+              localStorage.setItem("cached_championships", JSON.stringify(list));
+              sessionStorage.setItem("cached_championships", JSON.stringify(list));
+            } catch (eStore) {}
+
+            const currentOptions = Array.from(select.options).map((o) => o.value).filter(Boolean);
+            const newOptions = list.map((c) => c.id);
+            const isDifferent =
+              currentOptions.length !== newOptions.length ||
+              !currentOptions.every((val, i) => val === newOptions[i]);
+
+            if (isDifferent || select.options.length <= 1) {
+              select.innerHTML = "";
+              list.forEach((c) => {
+                const opt = document.createElement("option");
+                opt.value = c.id;
+                opt.textContent = c.name;
+                select.appendChild(opt);
+              });
+              if (previousVal && list.some((c) => c.id === previousVal)) {
+                select.value = previousVal;
+              } else if (select.options.length > 0) {
+                select.value = select.options[0].value;
+              }
+              if (!hasRenderedFast || select.value !== previousVal) {
+                resetAndLoad(true);
+              }
+            }
+          } else if (select.options.length === 0) {
             select.innerHTML = '<option value="">No hay campeonatos</option>';
-            return;
-          }
-          snapshot.forEach((doc) => {
-            const opt = document.createElement("option");
-            opt.value = doc.id;
-            opt.textContent =
-              doc.data().name || doc.data().nombre || "Campeonato";
-            select.appendChild(opt);
-          });
-          if (select.options.length > 0) {
-            select.value = select.options[0].value;
-            resetAndLoad();
           }
         } catch (e) {
           console.error("Error al cargar campeonatos:", e);
-          select.innerHTML =
-            '<option value="">Error cargando campeonatos</option>';
         }
       }
 
-      let fixturesListener = null;
-      let fixturesListener2 = null;
-      async function resetAndLoad() {
-        const campId = document.getElementById("campSelect").value;
+      function isRealMatch(m) {
+        if (!m || m.isRest) return false;
+        const loc = (m.local || "").trim().toUpperCase();
+        const vis = (m.visitor || "").trim().toUpperCase();
+        if (!loc || !vis) return false;
+        if (loc === "DESCANSA" || vis === "DESCANSA" || loc === "LIBRE" || vis === "LIBRE") return false;
+        return true;
+      }
+
+      function isOfficiallyProgrammed(m) {
+        if (!isRealMatch(m)) return false;
+        const f = (m.fechaRealAsignadaText || m.fechaReal || m.dia || m.date || "").trim();
+        const h = (m.horaRealAsignada || m.hora || "").trim();
+
+        const isInvalidFecha =
+          !f ||
+          f === "Por Definir" ||
+          f === "---" ||
+          f === "Pend" ||
+          f === "undefined" ||
+          f === "null" ||
+          /^fecha\s*\d+$/i.test(f) ||
+          /^jornada\s*\d+$/i.test(f);
+
+        const isInvalidHora =
+          !h ||
+          h === "--:--" ||
+          h === "Por programar" ||
+          h === "Por Definir" ||
+          h === "---" ||
+          h === "Pend" ||
+          h === "undefined" ||
+          h === "null";
+
+        return !isInvalidFecha && !isInvalidHora;
+      }
+
+      // Compatibilidad con funciones legadas
+      function isMatchProgrammed(m) {
+        return isRealMatch(m);
+      }
+
+      async function resetAndLoad(forceResetJornada = false) {
+        const campId = document.getElementById("campSelect")?.value;
         if (!campId) return;
+
+        if (forceResetJornada) {
+          currentJornada = null;
+        }
+
+        // Limpiar inmediatamente mapa de fixtures para evitar cruce de datos entre campeonatos
+        fixturesMap.clear();
 
         if (typeof preloadAllLeaguePlayersAndTeams === "function") {
           preloadAllLeaguePlayersAndTeams();
         }
 
-        // Detach previous listeners if exist
-        if (fixturesListener) fixturesListener();
-        if (fixturesListener2) fixturesListener2();
-
-        currentJornada = null;
-
-        // 1. FAST PATH: Si ya tenemos fixtures en memoria para este campeonato, renderizar de inmediato (0ms)
-        if (fixturesCacheByCamp.has(campId) && fixturesCacheByCamp.get(campId).size > 0) {
+        // 1. FAST PATH: Si ya tenemos fixtures en memoria o en almacenamiento local para este campeonato
+        if (fixturesCacheByCamp.has(campId)) {
           fixturesMap = new Map(fixturesCacheByCamp.get(campId));
           renderNavigation();
         } else {
-          fixturesMap.clear();
-          const jornadasGrid = document.getElementById("jornadasContainer");
-          const matchesList = document.getElementById("matchesContainer");
-          if (matchesList) matchesList.classList.add("d-none");
-          if (jornadasGrid) {
-            jornadasGrid.classList.remove("d-none");
-            jornadasGrid.innerHTML = `
-              <div class="col-12 text-center py-5">
-                <div class="spinner-border mb-3" style="width: 2.8rem; height: 2.8rem; color: #2ecc71;" role="status"></div>
-                <h5 class="text-white fw-bold mb-1">Cargando fechas programadas...</h5>
-                <p class="text-white-50 small mb-0">Sincronizando fixture oficial del campeonato</p>
-              </div>`;
+          try {
+            const cachedFixJson = localStorage.getItem("cached_fixtures_" + campId);
+            if (cachedFixJson) {
+              const entries = JSON.parse(cachedFixJson);
+              if (entries) {
+                fixturesMap = new Map(entries);
+                fixturesCacheByCamp.set(campId, new Map(fixturesMap));
+                renderNavigation();
+              }
+            }
+          } catch (eC) {}
+
+          if (fixturesMap.size === 0) {
+            const jornadasGrid = document.getElementById("jornadasContainer");
+            const matchesList = document.getElementById("matchesContainer");
+            if (matchesList) matchesList.classList.add("d-none");
+            if (jornadasGrid) {
+              jornadasGrid.classList.remove("d-none");
+              jornadasGrid.innerHTML = `
+                <div class="col-12 text-center py-5">
+                  <div class="spinner-border mb-3" style="width: 2.8rem; height: 2.8rem; color: #2ecc71;" role="status"></div>
+                  <h5 class="text-white fw-bold mb-1">Cargando fechas del campeonato...</h5>
+                  <p class="text-white-50 small mb-0">Sincronizando fixture oficial</p>
+                </div>`;
+            }
           }
         }
 
-        const rawDocsMap = new Map();
-        const handleFixtureSnapshot = (snapshot) => {
-          snapshot.forEach((doc) => {
-            rawDocsMap.set(doc.id, { id: doc.id, ...doc.data() });
-          });
+        // 2. Consultar directamente a Firestore para este campeonato
+        try {
+          const [snap1, snap2] = await Promise.all([
+            db
+              .collection("fixtures")
+              .where("championshipId", "==", campId)
+              .get()
+              .catch(() => ({ forEach: () => {} })),
+            db
+              .collection("fixtures")
+              .where("campeonatoId", "==", campId)
+              .get()
+              .catch(() => ({ forEach: () => {} })),
+          ]);
 
-          // Agrupamos y conservamos ÚNICAMENTE la versión más reciente por categoría (igual a gestion-fixture)
+          // Si el usuario cambió de campeonato durante la petición, no sobreescribir
+          const currentSelected = document.getElementById("campSelect")?.value;
+          if (currentSelected !== campId) return;
+
+          const rawDocsMap = new Map();
+          if (snap1 && typeof snap1.forEach === "function") {
+            snap1.forEach((doc) => rawDocsMap.set(doc.id, { id: doc.id, ...doc.data() }));
+          }
+          if (snap2 && typeof snap2.forEach === "function") {
+            snap2.forEach((doc) => rawDocsMap.set(doc.id, { id: doc.id, ...doc.data() }));
+          }
+
           const latestVersions = {};
           rawDocsMap.forEach((docData, docId) => {
             const cat = (docData.category || "DEFAULT").toUpperCase();
@@ -1046,11 +1171,9 @@
           Object.values(latestVersions).forEach((docData) => {
             if (docData && Array.isArray(docData.data)) {
               docData.data.forEach((m, idx) => {
-                // Garantizar matchId único y persistente
                 if (!m.matchId || m.matchId === "undefined") {
                   m.matchId = `${docData.id}_${idx}_${(m.local || "").replace(/\s+/g, "")}_${(m.visitor || "").replace(/\s+/g, "")}`;
                 }
-                // Garantizar número de jornada válido
                 if (
                   m.jornada === undefined ||
                   m.jornada === null ||
@@ -1066,7 +1189,6 @@
                 } else {
                   m.jornada = parseInt(m.jornada) || 1;
                 }
-                // Normalizar fecha / día real
                 const rawFechaReal = (
                   m.fechaRealAsignadaText ||
                   m.fechaReal ||
@@ -1089,7 +1211,6 @@
                   m.fechaRealAsignadaText = "Por Definir";
                 }
 
-                // Normalizar hora real
                 const rawHora = (m.horaRealAsignada || m.hora || "").trim();
                 if (
                   rawHora &&
@@ -1106,11 +1227,9 @@
                   m.horaRealAsignada = "--:--";
                 }
 
-                // Normalizar vocal
                 if (!m.vocalAsignado) {
                   m.vocalAsignado = m.vocal || "Por Asignar";
                 }
-                // Normalizar veedor
                 if (!m.veedorAsignado) {
                   m.veedorAsignado = m.veedor || "Por Asignar";
                 }
@@ -1118,15 +1237,16 @@
             }
             fixturesMap.set(docData.id, docData);
           });
-          // Guardar en caché rápida en memoria
+
           fixturesCacheByCamp.set(campId, new Map(fixturesMap));
+          try {
+            localStorage.setItem("cached_fixtures_" + campId, JSON.stringify(Array.from(fixturesMap.entries())));
+          } catch (eStore) {}
+
           renderNavigation();
 
-          // Si el modal está abierto, actualizar la referencia del partido en memoria
-          const modalEl = document.getElementById("vocaliaModal");
           if (
-            modalEl &&
-            modalEl.classList.contains("show") &&
+            document.getElementById("vocaliaModal")?.classList.contains("show") &&
             window.currentMatchOpened
           ) {
             for (let [fixId, meta] of fixturesMap) {
@@ -1152,75 +1272,17 @@
               }
             }
           }
-        };
+        } catch (e) {
+          console.error("Error al cargar fixtures del campeonato:", e);
+        }
 
-        // Escuchadores en tiempo real (con soporte de caché instantáneo)
-        fixturesListener = db
-          .collection("fixtures")
-          .where("championshipId", "==", campId)
-          .onSnapshot(handleFixtureSnapshot, (e) => console.error(e));
-
-        fixturesListener2 = db
-          .collection("fixtures")
-          .where("campeonatoId", "==", campId)
-          .onSnapshot(handleFixtureSnapshot, (e) => console.error(e));
-
-        // Precarga diferida en segundo plano: no satura la red mientras se renderizan las fechas
+        // Precarga diferida en segundo plano
         clearTimeout(_preloadChampionshipTimer);
         _preloadChampionshipTimer = setTimeout(() => {
           if (typeof preloadEntireChampionshipData === "function") {
             preloadEntireChampionshipData(campId);
           }
         }, 1200);
-      }
-
-      function isMatchProgrammed(m) {
-        if (
-          !m ||
-          m.isRest ||
-          m.local === "DESCANSA" ||
-          m.visitor === "DESCANSA" ||
-          m.local === "LIBRE" ||
-          m.visitor === "LIBRE"
-        ) {
-          return false;
-        }
-        if (!m.local || !m.visitor) return false;
-
-        const f = (
-          m.fechaRealAsignadaText ||
-          m.fechaReal ||
-          m.dia ||
-          m.date ||
-          ""
-        ).trim();
-        const h = (m.horaRealAsignada || m.hora || "").trim();
-
-        const isInvalidFecha =
-          !f ||
-          f === "Por Definir" ||
-          f === "---" ||
-          f === "Pend" ||
-          f === "undefined" ||
-          f === "null" ||
-          /^fecha\s*\d+$/i.test(f) ||
-          /^jornada\s*\d+$/i.test(f);
-
-        const isInvalidHora =
-          !h ||
-          h === "--:--" ||
-          h === "Por programar" ||
-          h === "Por Definir" ||
-          h === "---" ||
-          h === "Pend" ||
-          h === "undefined" ||
-          h === "null";
-
-        if (isInvalidFecha || isInvalidHora) {
-          return false;
-        }
-
-        return true;
       }
 
       function renderNavigation() {
@@ -1232,23 +1294,27 @@
           matchesList.classList.add("d-none");
           matchesList.innerHTML = "";
 
-          let jornadasProgramadas = new Set();
-          let counts = {};
+          let allJornadas = new Set();
+          let countsProgrammed = {};
+          let countsTotal = {};
 
           fixturesMap.forEach((meta) => {
             if (meta && Array.isArray(meta.data)) {
               meta.data.forEach((x) => {
-                if (isMatchProgrammed(x)) {
+                if (isRealMatch(x)) {
                   const j = parseInt(x.jornada) || 1;
-                  jornadasProgramadas.add(j);
-                  counts[j] = (counts[j] || 0) + 1;
+                  allJornadas.add(j);
+                  countsTotal[j] = (countsTotal[j] || 0) + 1;
+                  if (isOfficiallyProgrammed(x)) {
+                    countsProgrammed[j] = (countsProgrammed[j] || 0) + 1;
+                  }
                 }
               });
             }
           });
 
           // Convertir set a array y ordenar
-          const sortedJornadas = Array.from(jornadasProgramadas).sort(
+          const sortedJornadas = Array.from(allJornadas).sort(
             (a, b) => a - b,
           );
 
@@ -1257,23 +1323,42 @@
             jornadasGrid.innerHTML = `
               <div class="col-12 text-center py-5">
                 <i class="fas fa-calendar-times mb-3 opacity-25" style="font-size:3.5rem; color: #e74c3c;"></i>
-                <h4 class="text-white fw-bold mb-2">No hay jornadas programadas aún</h4>
+                <h4 class="text-white fw-bold mb-2">No hay fechas generadas en este campeonato</h4>
                 <p class="text-white-50 small mb-0" style="max-width: 480px; margin: 0 auto;">
-                  Solo se mostrarán las jornadas y partidos que hayan sido programados con fecha y horario oficial en el fixture.
+                  Aún no se ha generado el fixture para este campeonato. Ve a Gestión de Fixture para crearlo.
                 </p>
               </div>`;
             return;
           }
 
           sortedJornadas.forEach((j) => {
+            const prog = countsProgrammed[j] || 0;
+            const tot = countsTotal[j] || 0;
+            const hasProgrammed = prog > 0;
+
             jornadasGrid.insertAdjacentHTML(
               "beforeend",
               `
                 <div class="col">
-                    <div class="jornada-card-elite" onclick="selectJornada(${j})">
-                        <i class="fas fa-calendar-alt"></i>
+                    <div class="jornada-card-elite ${hasProgrammed ? "" : "opacity-75"}" onclick="selectJornada(${j})">
+                        <i class="fas ${hasProgrammed ? "fa-calendar-check text-success" : "fa-calendar-alt text-warning"}"></i>
                         <h5>Jornada ${j}</h5>
-                        <span class="match-count">${counts[j] || 0} PARTIDOS PROGRAMADOS</span>
+                        <div class="d-flex flex-column align-items-center gap-1 mt-2">
+                          ${
+                            hasProgrammed
+                              ? `<span class="badge bg-success-glass" style="font-size:0.65rem; letter-spacing:1px">
+                                  <i class="fas fa-bolt me-1 text-success"></i> ${prog} ${prog === 1 ? "PARTIDO PROGRAMADO" : "PARTIDOS PROGRAMADOS"}
+                                 </span>`
+                              : `<span class="badge bg-secondary-glass text-white-50" style="font-size:0.65rem; letter-spacing:1px">
+                                  <i class="fas fa-clock me-1 text-warning"></i> POR PROGRAMAR (${tot})
+                                 </span>`
+                          }
+                          ${
+                            hasProgrammed && tot > prog
+                              ? `<small class="text-white-50" style="font-size:0.6rem">${tot - prog} por programar</small>`
+                              : ""
+                          }
+                        </div>
                     </div>
                 </div>
             `,
@@ -1295,6 +1380,41 @@
         currentJornada = null;
         renderNavigation();
       }
+
+      function showPendingMatchAlert(local, visitor, category, jornada) {
+        if (typeof Swal !== "undefined") {
+          Swal.fire({
+            icon: "info",
+            title: '<span style="font-size:1.15rem; font-weight:800; text-transform:uppercase; letter-spacing:1px">Programación Pendiente</span>',
+            html: `
+              <div class="text-center p-2">
+                <div class="p-3 mb-3 rounded-3" style="background: rgba(255,255,255,0.04); border: 1px solid rgba(255,255,255,0.08);">
+                  <div class="d-flex align-items-center justify-content-center gap-3">
+                    <span class="fw-bold text-white text-uppercase" style="font-size:0.95rem">${local}</span>
+                    <span class="text-warning fw-900" style="font-size:0.75rem">VS</span>
+                    <span class="fw-bold text-white text-uppercase" style="font-size:0.95rem">${visitor}</span>
+                  </div>
+                  <div class="mt-2">
+                    <span class="badge bg-primary-glass" style="font-size:0.6rem">${category} - JORNADA ${jornada}</span>
+                  </div>
+                </div>
+                <p class="text-white-50 mb-0" style="font-size:0.85rem; line-height:1.5;">
+                  <i class="fas fa-calendar-times me-1 text-warning"></i> Este encuentro aún no cuenta con fecha, hora y cancha oficial asignadas.<br>
+                  <b class="text-white">La vocalía digital se habilitará automáticamente</b> en cuanto se asigne la programación en el fixture oficial.
+                </p>
+              </div>
+            `,
+            background: "#141820",
+            color: "#ffffff",
+            confirmButtonColor: "#2ecc71",
+            confirmButtonText: '<i class="fas fa-check me-1"></i> Entendido',
+            customClass: {
+              popup: "modal-premium",
+            },
+          });
+        }
+      }
+      window.showPendingMatchAlert = showPendingMatchAlert;
 
       async function renderMatches() {
         // Cargar mapa de logos de equipos con soporte de memoria caché instantánea
@@ -1337,7 +1457,7 @@
                 </button>
                 <div class="text-center">
                     <h4 class="text-white mb-0 text-uppercase fw-900" style="letter-spacing:3px">JORNADA ${currentJornada}</h4>
-                    <small class="text-primary-glow">Selecciona un encuentro para iniciar el acta</small>
+                    <small class="text-primary-glow">Selecciona un encuentro programado para iniciar el acta</small>
                 </div>
                 <div style="width:110px"></div>
             </div>
@@ -1349,7 +1469,7 @@
         fixturesMap.forEach((meta, fixId) => {
           meta.data.forEach((m) => {
             const matchJornada = parseInt(m.jornada) || 1;
-            if (matchJornada === currentJornada && isMatchProgrammed(m)) {
+            if (matchJornada === currentJornada && isRealMatch(m)) {
               matches.push({ ...m, _cat: meta.category, _fixId: fixId });
             }
           });
@@ -1357,6 +1477,10 @@
 
         const dayOrder = { Viernes: 1, Sábado: 2, Domingo: 3 };
         matches.sort((a, b) => {
+          const progA = isOfficiallyProgrammed(a) ? 0 : 1;
+          const progB = isOfficiallyProgrammed(b) ? 0 : 1;
+          if (progA !== progB) return progA - progB;
+
           const dayA = a.fechaRealAsignadaText || "";
           const dayB = b.fechaRealAsignadaText || "";
           if (dayOrder[dayA] !== dayOrder[dayB])
@@ -1371,46 +1495,64 @@
           cardCol.className = "col";
           const localLogo = logosMap[m.local] || "img/logo.png";
           const visitorLogo = logosMap[m.visitor] || "img/logo.png";
-          const fechaDisplay =
-            m.fechaRealAsignadaText ||
-            m.fechaReal ||
-            m.dia ||
-            m.date ||
-            "Por Definir";
-          const horaDisplay = m.horaRealAsignada || m.hora || "--:--";
-          const vocalDisplay = m.vocalAsignado || m.vocal || "Por Asignar";
+          const isProgrammed = isOfficiallyProgrammed(m);
+
+          const fechaDisplay = isProgrammed
+            ? (m.fechaRealAsignadaText || m.fechaReal || m.dia || m.date || "Por Definir")
+            : "Por programar";
+          const horaDisplay = isProgrammed
+            ? (m.horaRealAsignada || m.hora || "--:--")
+            : "Horario pendiente";
+          const vocalDisplay = isProgrammed
+            ? (m.vocalAsignado || m.vocal || "Por Asignar")
+            : "---";
+
+          const clickAction = isProgrammed
+            ? `openVocalActa('${m._fixId}', '${m.matchId}', '${m.local.replace(/'/g, "\\'")}', '${m.visitor.replace(/'/g, "\\'")}')`
+            : `showPendingMatchAlert('${m.local.replace(/'/g, "\\'")}', '${m.visitor.replace(/'/g, "\\'")}', '${m._cat || "MÁXIMA"}', ${currentJornada})`;
 
           cardCol.innerHTML = `
-            <div class="jornada-card-elite h-100 d-flex flex-column justify-content-between p-4" onclick="openVocalActa('${m._fixId}', '${m.matchId}', '${m.local.replace(/'/g, "\\'")}', '${m.visitor.replace(/'/g, "\\'")}')">
+            <div class="jornada-card-elite h-100 d-flex flex-column justify-content-between p-4" style="${isProgrammed ? "" : "opacity: 0.85; border-color: rgba(255,255,255,0.08);"}" onclick="${clickAction}">
                 <div class="mb-3 text-center">
-                    <span class="badge bg-primary-glass mb-4 text-uppercase" style="font-size:0.5rem; letter-spacing:2px; opacity:0.7">${m._cat || "MÁXIMA"}</span>
+                    <div class="d-flex justify-content-between align-items-center mb-3">
+                      <span class="badge bg-primary-glass text-uppercase" style="font-size:0.5rem; letter-spacing:2px; opacity:0.8">${m._cat || "MÁXIMA"}</span>
+                      ${
+                        isProgrammed
+                          ? `<span class="badge bg-success-glass" style="font-size:0.5rem; letter-spacing:1px"><i class="fas fa-play-circle me-1 text-success"></i> DISPONIBLE</span>`
+                          : `<span class="badge bg-secondary-glass text-warning" style="font-size:0.5rem; letter-spacing:1px"><i class="fas fa-lock me-1"></i> PENDIENTE</span>`
+                      }
+                    </div>
                     <div class="d-flex align-items-center justify-content-center gap-2 mb-2">
                         <div style="flex:1">
-                            <img src="${localLogo}" alt="Logo Local" class="mb-2" style="width:35px; height:35px; border-radius:50%; object-fit:cover; border:1px solid rgba(255,255,255,0.1)">
-                            <div class="text-white fw-800" style="font-size:0.75rem; text-transform:uppercase; line-height:1">${m.local}</div>
+                            <img src="${localLogo}" alt="Logo Local" class="mb-2" style="width:36px; height:36px; border-radius:50%; object-fit:cover; border:1px solid rgba(255,255,255,0.1)">
+                            <div class="text-white fw-800" style="font-size:0.75rem; text-transform:uppercase; line-height:1.1">${m.local}</div>
                         </div>
-                        <div class="text-primary-glow fw-900" style="font-size:0.5rem; opacity:0.5">VS</div>
+                        <div class="text-primary-glow fw-900" style="font-size:0.6rem; opacity:0.6">VS</div>
                         <div style="flex:1">
-                            <img src="${visitorLogo}" alt="Logo Visitante" class="mb-2" style="width:35px; height:35px; border-radius:50%; object-fit:cover; border:1px solid rgba(255,255,255,0.1)">
-                            <div class="text-white fw-800" style="font-size:0.75rem; text-transform:uppercase; line-height:1">${m.visitor}</div>
+                            <img src="${visitorLogo}" alt="Logo Visitante" class="mb-2" style="width:36px; height:36px; border-radius:50%; object-fit:cover; border:1px solid rgba(255,255,255,0.1)">
+                            <div class="text-white fw-800" style="font-size:0.75rem; text-transform:uppercase; line-height:1.1">${m.visitor}</div>
                         </div>
                     </div>
                 </div>
                 <div class="pt-3 border-top border-secondary border-opacity-25 text-center">
                     <div class="d-flex justify-content-center align-items-center gap-2 mb-3">
-                        <span class="text-white-50" style="font-size:0.85rem">
-                            <i class="far fa-calendar-alt me-1 text-primary-glow" style="font-size:1rem"></i> ${fechaDisplay}
+                        <span class="${isProgrammed ? "text-white-50" : "text-white-50 opacity-50"}" style="font-size:0.82rem">
+                            <i class="far fa-calendar-alt me-1 ${isProgrammed ? "text-primary-glow" : "text-warning"}" style="font-size:0.9rem"></i> ${fechaDisplay}
                         </span>
                         <span class="mx-1 opacity-10">|</span>
-                        <span class="text-white-50" style="font-size:0.85rem">
-                            <i class="far fa-clock me-1 text-primary-glow" style="font-size:1rem"></i> ${horaDisplay}
+                        <span class="${isProgrammed ? "text-white-50" : "text-white-50 opacity-50"}" style="font-size:0.82rem">
+                            <i class="far fa-clock me-1 ${isProgrammed ? "text-primary-glow" : "text-warning"}" style="font-size:0.9rem"></i> ${horaDisplay}
                         </span>
                     </div>
                     <div class="d-inline-flex flex-column align-items-center gap-2">
                         ${m.billingLocal || m.billingVisitor ? '<span class="badge bg-success bg-opacity-10 text-success border border-success border-opacity-25 mb-1" style="font-size:0.55rem">FACTURADO</span>' : ""}
-                        <div style="font-size:0.75rem; color:#f1c40f; line-height:1.1">
-                            <span class="text-white-50" style="font-size:0.6rem; letter-spacing:1px; opacity:0.8">VOCAL:</span> ${vocalDisplay}
-                        </div>
+                        ${
+                          isProgrammed
+                            ? `<div style="font-size:0.72rem; color:#f1c40f; line-height:1.1">
+                                 <span class="text-white-50" style="font-size:0.58rem; letter-spacing:1px; opacity:0.8">VOCAL:</span> ${vocalDisplay}
+                               </div>`
+                            : `<div class="text-white-50 small" style="font-size:0.65rem; opacity:0.6"><i class="fas fa-info-circle me-1"></i> Toca para ver info</div>`
+                        }
                     </div>
                 </div>
             </div>

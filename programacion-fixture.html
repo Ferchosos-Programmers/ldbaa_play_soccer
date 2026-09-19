@@ -281,9 +281,9 @@
         storageBucket: "ldbaa-calificaciones.firebasestorage.app",
         messagingSenderId: "277579489603",
         appId: "1:277579489603:web:bc93c22fea5f5f6b63cff6"
-      };
-    firebase.initializeApp(firebaseConfig);
+    if (!firebase.apps.length) firebase.initializeApp(firebaseConfig);
     const db = firebase.firestore();
+    db.settings({ experimentalForceLongPolling: true, merge: true });
     // Ejemplo de equipos por categoría
     const equiposPorCategoria = {
       maxima: ["Maxima FC", "Argelia Juniors", "Estrella Verde", "Juventud Unida"],

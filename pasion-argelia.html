@@ -380,6 +380,7 @@
     };
     if (!firebase.apps.length) firebase.initializeApp(firebaseConfig);
     const db = firebase.firestore();
+    db.settings({ experimentalForceLongPolling: true, merge: true });
 
     let currentChampionshipId = null;
     let currentChampionshipName = "Campeonato Oficial";
